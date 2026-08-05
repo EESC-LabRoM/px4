@@ -18,6 +18,7 @@
 #include <uORB/topics/vehicle_attitude.h>
 #include <uORB/topics/tune_control.h>
 #include <uORB/topics/manual_control_setpoint.h>
+#include <uORB/topics/trajectory_setpoint.h>
 #include <uORB/topics/parameter_update.h>
 
 using namespace time_literals;
@@ -72,7 +73,8 @@ private:
 	enum class Mode: uint8_t{
 		POSITION = 0,
 		TRAJECTORY_TRACKING = 1,
-		STEP_RESPONSE = 2
+		STEP_RESPONSE = 2,
+		EXTERNAL = 3
 	};
 
 	void parameters_update();
@@ -86,6 +88,7 @@ private:
 	uORB::Subscription _manual_control_input_sub{ORB_ID(manual_control_input)};
 	uORB::SubscriptionCallbackWorkItem _vehicle_local_position_sub{this, ORB_ID(vehicle_local_position)};
 	uORB::SubscriptionCallbackWorkItem _vehicle_attitude_sub{this, ORB_ID(vehicle_attitude)};
+	uORB::Subscription _trajectory_setpoint_sub{ORB_ID(trajectory_setpoint_raptor)};
 	uORB::Publication<rl_tools_command_s> _rl_tools_command_pub{ORB_ID(rl_tools_command)};
 	uORB::Publication<tune_control_s> _tune_control_pub{ORB_ID(tune_control)};
 
@@ -110,6 +113,11 @@ private:
 	Mode mode = DEFAULT_MODE;
 	FigureEight trajectory;
 	float step_response_offset[3] = {1, 0, 0};
+
+	// EXTERNAL mode: target streamed in via the trajectory_setpoint_raptor topic (companion/ego-planner)
+	trajectory_setpoint_s external_setpoint;
+	hrt_abstime last_external_setpoint_time;
+	bool external_setpoint_valid = false;
 
 	perf_counter_t	_loop_interval_perf{perf_alloc(PC_INTERVAL, MODULE_NAME": interval")};
 };

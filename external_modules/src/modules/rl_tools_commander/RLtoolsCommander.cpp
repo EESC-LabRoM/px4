@@ -5,6 +5,7 @@ RLtoolsCommander::RLtoolsCommander() : ModuleParams(nullptr), ScheduledWorkItem(
 	last_rc_update_time_set = false;
 	last_position_update_time_set = false;
 	last_attitude_update_time_set = false;
+	external_setpoint_valid = false;
 	activation_position[0] = 0;
 	activation_position[1] = 0;
 	activation_position[2] = 0;
@@ -117,6 +118,13 @@ void RLtoolsCommander::Run()
 			last_attitude_update_time = current_time;
 		}
 	}
+	{
+		// EXTERNAL mode setpoint stream (companion/ego-planner via uXRCE-DDS, NED absolute)
+		if(_trajectory_setpoint_sub.update(&external_setpoint)) {
+			last_external_setpoint_time = current_time;
+			external_setpoint_valid = true;
+		}
+	}
 
 
 	constexpr hrt_abstime POSITION_TIMEOUT = 1000*1000; // 100ms timeout
@@ -206,6 +214,43 @@ void RLtoolsCommander::Run()
 			command.target_linear_velocity[1] = 0;
 			command.target_linear_velocity[2] = 0;
 			break;
+		case Mode::EXTERNAL:
+		{
+			// Target streamed in via trajectory_setpoint_raptor (NED, absolute, same frame as
+			// vehicle_local_position). On staleness or before the first setpoint we FREEZE: hold the
+			// last good target_position and zero the velocity feedforward, so a planner dropout (or the
+			// pre-first-setpoint window) never flings the drone toward a zero/garbage target.
+			constexpr hrt_abstime EXTERNAL_SETPOINT_TIMEOUT = 300 * 1000; // 300 ms
+			bool fresh = external_setpoint_valid
+				&& ((current_time - last_external_setpoint_time) <= EXTERNAL_SETPOINT_TIMEOUT)
+				&& PX4_ISFINITE(external_setpoint.position[0])
+				&& PX4_ISFINITE(external_setpoint.position[1])
+				&& PX4_ISFINITE(external_setpoint.position[2]);
+			if(fresh){
+				target_position[0] = external_setpoint.position[0];
+				target_position[1] = external_setpoint.position[1];
+				target_position[2] = external_setpoint.position[2];
+				command.target_linear_velocity[0] = PX4_ISFINITE(external_setpoint.velocity[0]) ? external_setpoint.velocity[0] : 0;
+				command.target_linear_velocity[1] = PX4_ISFINITE(external_setpoint.velocity[1]) ? external_setpoint.velocity[1] : 0;
+				command.target_linear_velocity[2] = PX4_ISFINITE(external_setpoint.velocity[2]) ? external_setpoint.velocity[2] : 0;
+				if(PX4_ISFINITE(external_setpoint.yaw)){
+					target_orientation[0] = cosf(external_setpoint.yaw/2);
+					target_orientation[1] = 0;
+					target_orientation[2] = 0;
+					target_orientation[3] = sinf(external_setpoint.yaw/2);
+				}
+			}
+			else{
+				// freeze on the last good target
+				command.target_linear_velocity[0] = 0;
+				command.target_linear_velocity[1] = 0;
+				command.target_linear_velocity[2] = 0;
+			}
+			command.target_position[0] = target_position[0];
+			command.target_position[1] = target_position[1];
+			command.target_position[2] = target_position[2];
+			break;
+		}
 		default:
 			break;
 	}
@@ -273,9 +318,12 @@ int RLtoolsCommander::print_status()
 		case Mode::STEP_RESPONSE:
 			PX4_INFO_RAW("STEP_RESPONSE\n");
 			break;
+		case Mode::EXTERNAL:
+			PX4_INFO_RAW("EXTERNAL\n");
+			break;
 		default:
 			PX4_INFO_RAW("UNKNOWN\n");
-			break;	
+			break;
 	}
 	PX4_INFO_RAW("activation_position:\n\t%f\n\t%f\n\t%f\n", (double)activation_position[0], (double)activation_position[1], (double)activation_position[2]);
 	PX4_INFO_RAW("target_position:\n\t%f\n\t%f\n\t%f\n", (double)target_position[0], (double)target_position[1], (double)target_position[2]);
@@ -293,7 +341,7 @@ void print_custom_command_usage(){
 	PX4_INFO_RAW("- set_target_height xx.xx ([m])\n");
 	PX4_INFO_RAW("- set_target_position xx.xx yy.yy zz.zz ([m], FRD!)\n");
 	PX4_INFO_RAW("- set_target_yaw zz.zz ([rad], FRD!)\n");
-	PX4_INFO_RAW("- set_mode {POSITION,TRAJECTORY_TRACKING,STEP_RESPONSE}\n");
+	PX4_INFO_RAW("- set_mode {POSITION,TRAJECTORY_TRACKING,STEP_RESPONSE,EXTERNAL}\n");
 	PX4_INFO_RAW("- set_trajectory_scale ([m], default figure-eight is 2mx1m\n");
 	PX4_INFO_RAW("- set_trajectory_interval ([s], default interval is 5.5s\n");
 	PX4_INFO_RAW("- set_step_response_offset xx.xx yy.yy zz.zz ([m], FRD!\n");
@@ -415,7 +463,8 @@ int RLtoolsCommander::custom_command(int argc, char *argv[])
 				const char* mode_names[] = {
 					"POSITION",
 					"TRAJECTORY_TRACKING",
-					"STEP_RESPONSE"
+					"STEP_RESPONSE",
+					"EXTERNAL"
 				};
 				if(strcmp(argv[1], "POSITION") == 0){
 					PX4_INFO_RAW("Setting mode from %s to %s\n", mode_names[(uint8_t)get_instance()->mode], argv[1]);
@@ -438,6 +487,12 @@ int RLtoolsCommander::custom_command(int argc, char *argv[])
 						if(strcmp(argv[1], "STEP_RESPONSE") == 0){
 							PX4_INFO_RAW("Setting mode from %s to %s\n", mode_names[(uint8_t)get_instance()->mode], argv[1]);
 							get_instance()->mode = Mode::STEP_RESPONSE;
+							print_usage = false;
+							retval = 0;
+						}
+						else if(strcmp(argv[1], "EXTERNAL") == 0){
+							PX4_INFO_RAW("Setting mode from %s to %s\n", mode_names[(uint8_t)get_instance()->mode], argv[1]);
+							get_instance()->mode = Mode::EXTERNAL;
 							print_usage = false;
 							retval = 0;
 						}
