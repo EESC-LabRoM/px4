@@ -19,6 +19,8 @@
 #include <uORB/topics/tune_control.h>
 #include <uORB/topics/manual_control_setpoint.h>
 #include <uORB/topics/trajectory_setpoint.h>
+#include <uORB/topics/vehicle_status.h>
+#include <uORB/topics/vehicle_land_detected.h>
 #include <uORB/topics/parameter_update.h>
 
 using namespace time_literals;
@@ -81,7 +83,8 @@ private:
 
 	DEFINE_PARAMETERS(
 		(ParamInt<px4::params::RLT_ACTIV_SRC>) _rlt_activ_src,
-		(ParamInt<px4::params::RLT_ACTIV_BTN>) _rlt_activ_btn
+		(ParamInt<px4::params::RLT_ACTIV_BTN>) _rlt_activ_btn,
+		(ParamFloat<px4::params::RLT_AUTO_ALT>) _rlt_auto_alt
 	)
 
 	uORB::SubscriptionInterval _parameter_update_sub{ORB_ID(parameter_update), 1_s};
@@ -89,6 +92,8 @@ private:
 	uORB::SubscriptionCallbackWorkItem _vehicle_local_position_sub{this, ORB_ID(vehicle_local_position)};
 	uORB::SubscriptionCallbackWorkItem _vehicle_attitude_sub{this, ORB_ID(vehicle_attitude)};
 	uORB::Subscription _trajectory_setpoint_sub{ORB_ID(trajectory_setpoint_raptor)};
+	uORB::Subscription _vehicle_status_sub{ORB_ID(vehicle_status)};
+	uORB::Subscription _vehicle_land_detected_sub{ORB_ID(vehicle_land_detected)};
 	uORB::Publication<rl_tools_command_s> _rl_tools_command_pub{ORB_ID(rl_tools_command)};
 	uORB::Publication<tune_control_s> _tune_control_pub{ORB_ID(tune_control)};
 
@@ -113,6 +118,12 @@ private:
 	Mode mode = DEFAULT_MODE;
 	FigureEight trajectory;
 	float step_response_offset[3] = {1, 0, 0};
+
+	// AUTO activation (RLT_ACTIV_SRC == 2): engage once OFFBOARD takeoff is above RLT_AUTO_ALT
+	vehicle_status_s vehicle_status{};
+	vehicle_land_detected_s vehicle_land_detected{};
+	bool auto_engaged = false;
+	bool rc_permits = false;
 
 	// EXTERNAL mode: target streamed in via the trajectory_setpoint_raptor topic (companion/ego-planner)
 	trajectory_setpoint_s external_setpoint;

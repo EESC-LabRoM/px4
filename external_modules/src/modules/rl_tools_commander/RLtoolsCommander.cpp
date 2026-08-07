@@ -92,10 +92,11 @@ void RLtoolsCommander::Run()
 		if(_manual_control_input_sub.update(&manual_control_input)) {
 			last_rc_update_time_set = true;
 			last_rc_update_time = current_time;
+			rc_permits = manual_control_input.aux1 >= 0.5f;
 			if(_rlt_activ_src.get() == 0){
-				next_command_active = manual_control_input.aux1 >= 0.5f;
+				next_command_active = rc_permits;
 			}
-			else{
+			else if(_rlt_activ_src.get() == 1){
 				next_command_active = (manual_control_input.buttons & (1 << _rlt_activ_btn.get())) != 0;
 			}
 		}
@@ -126,6 +127,18 @@ void RLtoolsCommander::Run()
 		}
 	}
 
+	_vehicle_status_sub.update(&vehicle_status);
+	_vehicle_land_detected_sub.update(&vehicle_land_detected);
+	if(_rlt_activ_src.get() == 2 && !overwrite){
+		// AUTO: PX4 flies the OFFBOARD takeoff, the policy takes over once above RLT_AUTO_ALT. Two
+		// independent aborts, neither of which the companion can hold open: the pilot leaving OFFBOARD
+		// (any other nav_state clears the latch) and the pilot releasing AUX1. Requiring both means a
+		// later unintended return to OFFBOARD cannot silently re-engage the policy after an abort.
+		bool offboard = vehicle_status.nav_state == vehicle_status_s::NAVIGATION_STATE_OFFBOARD;
+		bool above_takeoff_altitude = !vehicle_land_detected.landed && (-vehicle_local_position.z >= _rlt_auto_alt.get());
+		auto_engaged = offboard && (auto_engaged || above_takeoff_altitude);
+		next_command_active = auto_engaged && (!last_rc_update_time_set || rc_permits);
+	}
 
 	constexpr hrt_abstime POSITION_TIMEOUT = 1000*1000; // 100ms timeout
 	constexpr hrt_abstime ATTITUDE_TIMEOUT = 1000*1000; // 100ms timeout
@@ -330,6 +343,9 @@ int RLtoolsCommander::print_status()
 	PX4_INFO_RAW("activation_orientation:\n\t%f\n\t%f\n\t%f\n\t%f\n", (double)activation_orientation[0], (double)activation_orientation[1], (double)activation_orientation[2], (double)activation_orientation[3]);
 	PX4_INFO_RAW("target_orientation:\n\t%f\n\t%f\n\t%f\n\t%f\n", (double)target_orientation[0], (double)target_orientation[1], (double)target_orientation[2], (double)target_orientation[3]);
 	PX4_INFO_RAW("command_active: %s\n", command_active ? "true" : "false");
+	PX4_INFO_RAW("activ_src: %d\n", (int)_rlt_activ_src.get());
+	PX4_INFO_RAW("auto_engaged: %s (nav_state: %d, auto_alt: %f)\n", auto_engaged ? "true" : "false", (int)vehicle_status.nav_state, (double)_rlt_auto_alt.get());
+	PX4_INFO_RAW("rc_permits: %s (rc seen: %s)\n", rc_permits ? "true" : "false", last_rc_update_time_set ? "true" : "false");
 	PX4_INFO_RAW("target_height: %f\n", (double)target_height);
 	PX4_INFO_RAW("step_response_offset:\n\t%f\n\t%f\n\t%f\n", (double)step_response_offset[0], (double)step_response_offset[1], (double)step_response_offset[2]);
 	perf_print_counter(_loop_interval_perf);
