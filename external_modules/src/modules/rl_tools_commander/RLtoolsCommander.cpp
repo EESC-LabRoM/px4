@@ -134,9 +134,19 @@ void RLtoolsCommander::Run()
 		// independent aborts, neither of which the companion can hold open: the pilot leaving OFFBOARD
 		// (any other nav_state clears the latch) and the pilot releasing AUX1. Requiring both means a
 		// later unintended return to OFFBOARD cannot silently re-engage the policy after an abort.
+		// Landing is flown by PX4's position controller (descent and ground effect are out of
+		// distribution for the policy). Once a descent-to-ground state is entered the latch makes it
+		// final for the flight: without it, re-selecting OFFBOARD mid-descent would re-engage the policy
+		// close to the ground, which is the worst place for it. Only disarming clears the latch.
+		bool descending = vehicle_status.nav_state == vehicle_status_s::NAVIGATION_STATE_AUTO_LAND
+			|| vehicle_status.nav_state == vehicle_status_s::NAVIGATION_STATE_DESCEND
+			|| vehicle_status.nav_state == vehicle_status_s::NAVIGATION_STATE_AUTO_RTL;
+		bool armed = vehicle_status.arming_state == vehicle_status_s::ARMING_STATE_ARMED;
+		landing_latch = armed && (descending || landing_latch);
+
 		bool offboard = vehicle_status.nav_state == vehicle_status_s::NAVIGATION_STATE_OFFBOARD;
 		bool above_takeoff_altitude = !vehicle_land_detected.landed && (-vehicle_local_position.z >= _rlt_auto_alt.get());
-		auto_engaged = offboard && (auto_engaged || above_takeoff_altitude);
+		auto_engaged = offboard && !landing_latch && (auto_engaged || above_takeoff_altitude);
 		next_command_active = auto_engaged && (!last_rc_update_time_set || rc_permits);
 	}
 
@@ -345,6 +355,7 @@ int RLtoolsCommander::print_status()
 	PX4_INFO_RAW("command_active: %s\n", command_active ? "true" : "false");
 	PX4_INFO_RAW("activ_src: %d\n", (int)_rlt_activ_src.get());
 	PX4_INFO_RAW("auto_engaged: %s (nav_state: %d, auto_alt: %f)\n", auto_engaged ? "true" : "false", (int)vehicle_status.nav_state, (double)_rlt_auto_alt.get());
+	PX4_INFO_RAW("landing_latch: %s (blocks re-engage until disarm)\n", landing_latch ? "true" : "false");
 	PX4_INFO_RAW("rc_permits: %s (rc seen: %s)\n", rc_permits ? "true" : "false", last_rc_update_time_set ? "true" : "false");
 	PX4_INFO_RAW("target_height: %f\n", (double)target_height);
 	PX4_INFO_RAW("step_response_offset:\n\t%f\n\t%f\n\t%f\n", (double)step_response_offset[0], (double)step_response_offset[1], (double)step_response_offset[2]);

@@ -124,6 +124,7 @@ private:
 	vehicle_land_detected_s vehicle_land_detected{};
 	bool auto_engaged = false;
 	bool rc_permits = false;
+	bool landing_latch = false;
 
 	// EXTERNAL mode: target streamed in via the trajectory_setpoint_raptor topic (companion/ego-planner)
 	trajectory_setpoint_s external_setpoint;
