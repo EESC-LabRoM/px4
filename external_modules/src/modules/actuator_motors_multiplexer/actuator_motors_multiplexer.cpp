@@ -188,14 +188,17 @@ void ActuatorMotorsMultiplexer::Run()
 			if(!std::isnan(actuator_motors_mux.control[i])){
 				actuator_motors_mux.control[i] = fminf(_rlt_mux_clip_max.get(), actuator_motors_mux.control[i]);
 			}
-		}	
-		rl_tools_multiplexer_status_s status;
-		status.timestamp = current_time;
-		status.timestamp_sample = actuator_motors_mux.timestamp_sample;
-		status.active = !this->use_original_controller;
+		}
 		_actuator_motors_mux_pub.publish(actuator_motors_mux);
-		_rl_tools_multiplexer_status_pub.publish(status);
 	}
+	// published every cycle (also when inactive/deactivated) so that consumers can tell "RLtools is
+	// not in control" apart from "the multiplexer is dead": mc_rate_control/mc_pos_control hold their
+	// integrators at zero while active and must fall back to normal behavior if this stream stops.
+	rl_tools_multiplexer_status_s status;
+	status.timestamp = current_time;
+	status.timestamp_sample = current_time;
+	status.active = !this->use_original_controller && !deactivated && actuator_motors_mux_set;
+	_rl_tools_multiplexer_status_pub.publish(status);
 	perf_count(_loop_interval_perf);
 
 }
