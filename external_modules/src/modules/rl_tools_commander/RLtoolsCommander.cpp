@@ -5,6 +5,7 @@ RLtoolsCommander::RLtoolsCommander() : ModuleParams(nullptr), ScheduledWorkItem(
 	last_rc_update_time_set = false;
 	last_position_update_time_set = false;
 	last_attitude_update_time_set = false;
+	external_setpoint_valid = false;
 	activation_position[0] = 0;
 	activation_position[1] = 0;
 	activation_position[2] = 0;
@@ -91,10 +92,11 @@ void RLtoolsCommander::Run()
 		if(_manual_control_input_sub.update(&manual_control_input)) {
 			last_rc_update_time_set = true;
 			last_rc_update_time = current_time;
+			rc_permits = manual_control_input.aux1 >= 0.5f;
 			if(_rlt_activ_src.get() == 0){
-				next_command_active = manual_control_input.aux1 >= 0.5f;
+				next_command_active = rc_permits;
 			}
-			else{
+			else if(_rlt_activ_src.get() == 1){
 				next_command_active = (manual_control_input.buttons & (1 << _rlt_activ_btn.get())) != 0;
 			}
 		}
@@ -117,7 +119,36 @@ void RLtoolsCommander::Run()
 			last_attitude_update_time = current_time;
 		}
 	}
+	{
+		// EXTERNAL mode setpoint stream (companion/ego-planner via uXRCE-DDS, NED absolute)
+		if(_trajectory_setpoint_sub.update(&external_setpoint)) {
+			last_external_setpoint_time = current_time;
+			external_setpoint_valid = true;
+		}
+	}
 
+	_vehicle_status_sub.update(&vehicle_status);
+	_vehicle_land_detected_sub.update(&vehicle_land_detected);
+	if(_rlt_activ_src.get() == 2 && !overwrite){
+		// AUTO: PX4 flies the OFFBOARD takeoff, the policy takes over once above RLT_AUTO_ALT. Two
+		// independent aborts, neither of which the companion can hold open: the pilot leaving OFFBOARD
+		// (any other nav_state clears the latch) and the pilot releasing AUX1. Requiring both means a
+		// later unintended return to OFFBOARD cannot silently re-engage the policy after an abort.
+		// Landing is flown by PX4's position controller (descent and ground effect are out of
+		// distribution for the policy). Once a descent-to-ground state is entered the latch makes it
+		// final for the flight: without it, re-selecting OFFBOARD mid-descent would re-engage the policy
+		// close to the ground, which is the worst place for it. Only disarming clears the latch.
+		bool descending = vehicle_status.nav_state == vehicle_status_s::NAVIGATION_STATE_AUTO_LAND
+			|| vehicle_status.nav_state == vehicle_status_s::NAVIGATION_STATE_DESCEND
+			|| vehicle_status.nav_state == vehicle_status_s::NAVIGATION_STATE_AUTO_RTL;
+		bool armed = vehicle_status.arming_state == vehicle_status_s::ARMING_STATE_ARMED;
+		landing_latch = armed && (descending || landing_latch);
+
+		bool offboard = vehicle_status.nav_state == vehicle_status_s::NAVIGATION_STATE_OFFBOARD;
+		bool above_takeoff_altitude = !vehicle_land_detected.landed && (-vehicle_local_position.z >= _rlt_auto_alt.get());
+		auto_engaged = offboard && !landing_latch && (auto_engaged || above_takeoff_altitude);
+		next_command_active = auto_engaged && (!last_rc_update_time_set || rc_permits);
+	}
 
 	constexpr hrt_abstime POSITION_TIMEOUT = 1000*1000; // 100ms timeout
 	constexpr hrt_abstime ATTITUDE_TIMEOUT = 1000*1000; // 100ms timeout
@@ -206,6 +237,43 @@ void RLtoolsCommander::Run()
 			command.target_linear_velocity[1] = 0;
 			command.target_linear_velocity[2] = 0;
 			break;
+		case Mode::EXTERNAL:
+		{
+			// Target streamed in via trajectory_setpoint_raptor (NED, absolute, same frame as
+			// vehicle_local_position). On staleness or before the first setpoint we FREEZE: hold the
+			// last good target_position and zero the velocity feedforward, so a planner dropout (or the
+			// pre-first-setpoint window) never flings the drone toward a zero/garbage target.
+			constexpr hrt_abstime EXTERNAL_SETPOINT_TIMEOUT = 300 * 1000; // 300 ms
+			bool fresh = external_setpoint_valid
+				&& ((current_time - last_external_setpoint_time) <= EXTERNAL_SETPOINT_TIMEOUT)
+				&& PX4_ISFINITE(external_setpoint.position[0])
+				&& PX4_ISFINITE(external_setpoint.position[1])
+				&& PX4_ISFINITE(external_setpoint.position[2]);
+			if(fresh){
+				target_position[0] = external_setpoint.position[0];
+				target_position[1] = external_setpoint.position[1];
+				target_position[2] = external_setpoint.position[2];
+				command.target_linear_velocity[0] = PX4_ISFINITE(external_setpoint.velocity[0]) ? external_setpoint.velocity[0] : 0;
+				command.target_linear_velocity[1] = PX4_ISFINITE(external_setpoint.velocity[1]) ? external_setpoint.velocity[1] : 0;
+				command.target_linear_velocity[2] = PX4_ISFINITE(external_setpoint.velocity[2]) ? external_setpoint.velocity[2] : 0;
+				if(PX4_ISFINITE(external_setpoint.yaw)){
+					target_orientation[0] = cosf(external_setpoint.yaw/2);
+					target_orientation[1] = 0;
+					target_orientation[2] = 0;
+					target_orientation[3] = sinf(external_setpoint.yaw/2);
+				}
+			}
+			else{
+				// freeze on the last good target
+				command.target_linear_velocity[0] = 0;
+				command.target_linear_velocity[1] = 0;
+				command.target_linear_velocity[2] = 0;
+			}
+			command.target_position[0] = target_position[0];
+			command.target_position[1] = target_position[1];
+			command.target_position[2] = target_position[2];
+			break;
+		}
 		default:
 			break;
 	}
@@ -273,15 +341,22 @@ int RLtoolsCommander::print_status()
 		case Mode::STEP_RESPONSE:
 			PX4_INFO_RAW("STEP_RESPONSE\n");
 			break;
+		case Mode::EXTERNAL:
+			PX4_INFO_RAW("EXTERNAL\n");
+			break;
 		default:
 			PX4_INFO_RAW("UNKNOWN\n");
-			break;	
+			break;
 	}
 	PX4_INFO_RAW("activation_position:\n\t%f\n\t%f\n\t%f\n", (double)activation_position[0], (double)activation_position[1], (double)activation_position[2]);
 	PX4_INFO_RAW("target_position:\n\t%f\n\t%f\n\t%f\n", (double)target_position[0], (double)target_position[1], (double)target_position[2]);
 	PX4_INFO_RAW("activation_orientation:\n\t%f\n\t%f\n\t%f\n\t%f\n", (double)activation_orientation[0], (double)activation_orientation[1], (double)activation_orientation[2], (double)activation_orientation[3]);
 	PX4_INFO_RAW("target_orientation:\n\t%f\n\t%f\n\t%f\n\t%f\n", (double)target_orientation[0], (double)target_orientation[1], (double)target_orientation[2], (double)target_orientation[3]);
 	PX4_INFO_RAW("command_active: %s\n", command_active ? "true" : "false");
+	PX4_INFO_RAW("activ_src: %d\n", (int)_rlt_activ_src.get());
+	PX4_INFO_RAW("auto_engaged: %s (nav_state: %d, auto_alt: %f)\n", auto_engaged ? "true" : "false", (int)vehicle_status.nav_state, (double)_rlt_auto_alt.get());
+	PX4_INFO_RAW("landing_latch: %s (blocks re-engage until disarm)\n", landing_latch ? "true" : "false");
+	PX4_INFO_RAW("rc_permits: %s (rc seen: %s)\n", rc_permits ? "true" : "false", last_rc_update_time_set ? "true" : "false");
 	PX4_INFO_RAW("target_height: %f\n", (double)target_height);
 	PX4_INFO_RAW("step_response_offset:\n\t%f\n\t%f\n\t%f\n", (double)step_response_offset[0], (double)step_response_offset[1], (double)step_response_offset[2]);
 	perf_print_counter(_loop_interval_perf);
@@ -293,7 +368,7 @@ void print_custom_command_usage(){
 	PX4_INFO_RAW("- set_target_height xx.xx ([m])\n");
 	PX4_INFO_RAW("- set_target_position xx.xx yy.yy zz.zz ([m], FRD!)\n");
 	PX4_INFO_RAW("- set_target_yaw zz.zz ([rad], FRD!)\n");
-	PX4_INFO_RAW("- set_mode {POSITION,TRAJECTORY_TRACKING,STEP_RESPONSE}\n");
+	PX4_INFO_RAW("- set_mode {POSITION,TRAJECTORY_TRACKING,STEP_RESPONSE,EXTERNAL}\n");
 	PX4_INFO_RAW("- set_trajectory_scale ([m], default figure-eight is 2mx1m\n");
 	PX4_INFO_RAW("- set_trajectory_interval ([s], default interval is 5.5s\n");
 	PX4_INFO_RAW("- set_step_response_offset xx.xx yy.yy zz.zz ([m], FRD!\n");
@@ -415,7 +490,8 @@ int RLtoolsCommander::custom_command(int argc, char *argv[])
 				const char* mode_names[] = {
 					"POSITION",
 					"TRAJECTORY_TRACKING",
-					"STEP_RESPONSE"
+					"STEP_RESPONSE",
+					"EXTERNAL"
 				};
 				if(strcmp(argv[1], "POSITION") == 0){
 					PX4_INFO_RAW("Setting mode from %s to %s\n", mode_names[(uint8_t)get_instance()->mode], argv[1]);
@@ -438,6 +514,12 @@ int RLtoolsCommander::custom_command(int argc, char *argv[])
 						if(strcmp(argv[1], "STEP_RESPONSE") == 0){
 							PX4_INFO_RAW("Setting mode from %s to %s\n", mode_names[(uint8_t)get_instance()->mode], argv[1]);
 							get_instance()->mode = Mode::STEP_RESPONSE;
+							print_usage = false;
+							retval = 0;
+						}
+						else if(strcmp(argv[1], "EXTERNAL") == 0){
+							PX4_INFO_RAW("Setting mode from %s to %s\n", mode_names[(uint8_t)get_instance()->mode], argv[1]);
+							get_instance()->mode = Mode::EXTERNAL;
 							print_usage = false;
 							retval = 0;
 						}
