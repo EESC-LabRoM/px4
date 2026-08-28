@@ -119,12 +119,14 @@ private:
 	FigureEight trajectory;
 	float step_response_offset[3] = {1, 0, 0};
 
-	// AUTO activation (RLT_ACTIV_SRC == 2): engage once OFFBOARD takeoff is above RLT_AUTO_ALT
+	// AUTO activation (RLT_ACTIV_SRC == 2): engage above RLT_AUTO_ALT in OFFBOARD with AUX1 high.
+	// Losing OFFBOARD or AUX1 after the engage, or descending, latches until disarm.
 	vehicle_status_s vehicle_status{};
 	vehicle_land_detected_s vehicle_land_detected{};
 	bool auto_engaged = false;
 	bool rc_permits = false;
-	bool landing_latch = false;
+	bool abort_latch = false;
+	const char *abort_reason = nullptr;
 
 	// EXTERNAL mode: target streamed in via the trajectory_setpoint_raptor topic (companion/ego-planner)
 	trajectory_setpoint_s external_setpoint;

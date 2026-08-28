@@ -130,24 +130,37 @@ void RLtoolsCommander::Run()
 	_vehicle_status_sub.update(&vehicle_status);
 	_vehicle_land_detected_sub.update(&vehicle_land_detected);
 	if(_rlt_activ_src.get() == 2 && !overwrite){
-		// AUTO: PX4 flies the OFFBOARD takeoff, the policy takes over once above RLT_AUTO_ALT. Two
-		// independent aborts, neither of which the companion can hold open: the pilot leaving OFFBOARD
-		// (any other nav_state clears the latch) and the pilot releasing AUX1. Requiring both means a
-		// later unintended return to OFFBOARD cannot silently re-engage the policy after an abort.
-		// Landing is flown by PX4's position controller (descent and ground effect are out of
-		// distribution for the policy). Once a descent-to-ground state is entered the latch makes it
-		// final for the flight: without it, re-selecting OFFBOARD mid-descent would re-engage the policy
-		// close to the ground, which is the worst place for it. Only disarming clears the latch.
+		// AUTO: PX4 flies the OFFBOARD takeoff, the policy takes over above RLT_AUTO_ALT while AUX1 is
+		// high. Leaving OFFBOARD, releasing AUX1 and entering a descent all latch until disarm, so
+		// restoring the lost condition cannot hand the motors back to the policy in mid-air.
 		bool descending = vehicle_status.nav_state == vehicle_status_s::NAVIGATION_STATE_AUTO_LAND
 			|| vehicle_status.nav_state == vehicle_status_s::NAVIGATION_STATE_DESCEND
 			|| vehicle_status.nav_state == vehicle_status_s::NAVIGATION_STATE_AUTO_RTL;
 		bool armed = vehicle_status.arming_state == vehicle_status_s::ARMING_STATE_ARMED;
-		landing_latch = armed && (descending || landing_latch);
-
 		bool offboard = vehicle_status.nav_state == vehicle_status_s::NAVIGATION_STATE_OFFBOARD;
+		bool rc_seen = last_rc_update_time_set;
+		bool permitted = !rc_seen || rc_permits;
+
+		// Previous cycle's auto_engaged: an abort only counts once the policy was actually flying.
+		// Before the engage, being outside OFFBOARD (armed in POSITION) and AUX1 low are both normal.
+		bool lost_offboard = auto_engaged && !offboard;
+		bool lost_rc_permit = auto_engaged && rc_seen && !rc_permits;
+
+		bool prev_abort_latch = abort_latch;
+		abort_latch = armed && (abort_latch || descending || lost_offboard || lost_rc_permit);
+		if(abort_latch && !prev_abort_latch){
+			abort_reason = descending ? "descending" : (lost_offboard ? "left OFFBOARD" : "AUX1 released");
+			PX4_WARN("AUTO abort latched (%s), no re-engage until disarm", abort_reason);
+		}
+		if(!abort_latch){
+			abort_reason = nullptr;
+		}
+
+		// permitted gates the engage, not the output: gating only the output would let auto_engaged
+		// set with AUX1 still low, and lost_rc_permit would latch the flight dead on the next cycle.
 		bool above_takeoff_altitude = !vehicle_land_detected.landed && (-vehicle_local_position.z >= _rlt_auto_alt.get());
-		auto_engaged = offboard && !landing_latch && (auto_engaged || above_takeoff_altitude);
-		next_command_active = auto_engaged && (!last_rc_update_time_set || rc_permits);
+		auto_engaged = offboard && permitted && !abort_latch && (auto_engaged || above_takeoff_altitude);
+		next_command_active = auto_engaged;
 	}
 
 	constexpr hrt_abstime POSITION_TIMEOUT = 1000*1000; // 100ms timeout
@@ -354,8 +367,8 @@ int RLtoolsCommander::print_status()
 	PX4_INFO_RAW("target_orientation:\n\t%f\n\t%f\n\t%f\n\t%f\n", (double)target_orientation[0], (double)target_orientation[1], (double)target_orientation[2], (double)target_orientation[3]);
 	PX4_INFO_RAW("command_active: %s\n", command_active ? "true" : "false");
 	PX4_INFO_RAW("activ_src: %d\n", (int)_rlt_activ_src.get());
-	PX4_INFO_RAW("auto_engaged: %s (nav_state: %d, auto_alt: %f)\n", auto_engaged ? "true" : "false", (int)vehicle_status.nav_state, (double)_rlt_auto_alt.get());
-	PX4_INFO_RAW("landing_latch: %s (blocks re-engage until disarm)\n", landing_latch ? "true" : "false");
+	PX4_INFO_RAW("auto_engaged: %s (policy driving; nav_state: %d, auto_alt: %f)\n", auto_engaged ? "true" : "false", (int)vehicle_status.nav_state, (double)_rlt_auto_alt.get());
+	PX4_INFO_RAW("abort_latch: %s (%s; blocks re-engage until disarm)\n", abort_latch ? "true" : "false", abort_reason ? abort_reason : "-");
 	PX4_INFO_RAW("rc_permits: %s (rc seen: %s)\n", rc_permits ? "true" : "false", last_rc_update_time_set ? "true" : "false");
 	PX4_INFO_RAW("target_height: %f\n", (double)target_height);
 	PX4_INFO_RAW("step_response_offset:\n\t%f\n\t%f\n\t%f\n", (double)step_response_offset[0], (double)step_response_offset[1], (double)step_response_offset[2]);

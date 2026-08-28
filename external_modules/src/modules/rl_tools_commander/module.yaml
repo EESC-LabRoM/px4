@@ -19,7 +19,8 @@ parameters:
             long: |
               Only used when RLT_ACTIV_SRC is AUTO. The policy engages once the vehicle is in OFFBOARD,
               not landed, and above this altitude, and only while AUX1 is held high (if an RC is connected).
-              Leaving OFFBOARD or releasing AUX1 disengages immediately.
+              Leaving OFFBOARD, releasing AUX1 or entering LAND/DESCEND/RTL disengages the policy and
+              latches: restoring the condition does not re-engage it. Only disarming clears the latch.
           type: float
           unit: m
           default: 1.5
